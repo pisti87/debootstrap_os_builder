@@ -5,7 +5,7 @@ Test-phase project for building an operating system using debootstrap. Currently
 
 boot_mode=liveboot testing and okay
    .config file 
-
+```
    # ==============================================configuration
 # Automatikusan generált fájl – NE szerkeszd kézzel
 # Automatically generated – DO NOT EDIT
@@ -75,3 +75,4 @@ WOOF_VERSION="9"
 #Ez minden mást vezérel:
 #make_initrd.sh
 #make_iso.sh
+```
