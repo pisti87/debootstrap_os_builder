@@ -1,0 +1,342 @@
+#!/bin/bash
+set -euo pipefail
+
+# -------------------------------------------------
+# Project root
+# -------------------------------------------------
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CONFIG_FILE="$PROJECT_DIR/.config"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/system_patch_$(date +%F_%H-%M-%S).log"
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "ERROR: .config not found! Run config.sh first."
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+: "${CHROOT_DIR:?CHROOT_DIR not set in .config}"
+: "${DISTRO_COMPAT_VERSION:?DISTRO_COMPAT_VERSION not set}"
+: "${KERNEL_VERSION:?KERNEL_VERSION not set}"
+: "${KERNEL_FLAVOUR:?KERNEL_FLAVOUR not set}"
+
+echo "=============================================="
+echo "     System Patch alkalmazása"
+echo "=============================================="
+
+apt-get update
+
+apt-get install -y \
+  debootstrap \
+  squashfs-tools \
+  xz-utils \
+  grub-pc-bin \
+  grub-efi-amd64-bin \
+  grub-common \
+  mtools \
+  dosfstools \
+  live-boot \
+  live-tools \
+  busybox \
+  rsync \
+  cpio
+
+CONFIG_FILE_excalibur="/usr/share/debootstrap/scripts"
+mkdir -p "$CONFIG_FILE_excalibur"
+# save original file 
+if [[ -f "$CONFIG_FILE_excalibur/excalibur" ]]; then
+    echo "FIGYELEM: excalibur debootstrap script már létezik!"
+    cp -a "$CONFIG_FILE_excalibur/excalibur" \
+          "$CONFIG_FILE_excalibur/excalibur.bak.$(date +%s)"
+fi
+
+cat > "$CONFIG_FILE_excalibur/excalibur" << 'EOF'
+default_mirror http://deb.devuan.org/merged
+mirror_style release
+download_style apt
+finddebs_style from-indices
+variants - buildd fakechroot minbase
+keyring /usr/share/keyrings/devuan-archive-keyring.gpg
+
+if doing_variant fakechroot; then
+	test "$FAKECHROOT" = "true" || error 1 FAKECHROOTREQ "This variant requires fakechroot environment to be started"
+fi
+
+case $ARCH in
+	alpha|ia64) LIBC="libc6.1" ;;
+	kfreebsd-*) LIBC="libc0.1" ;;
+	hurd-*)     LIBC="libc0.3" ;;
+	*)          LIBC="libc6" ;;
+esac
+
+# Based on functions resolve_deps()
+get_depends() {
+    local pkgs m1 s c a path pkgdest
+    pkgs="$*"
+    shift
+
+    archs="$ARCH"
+    if [ $ARCH_ALL_SUPPORTED -eq 1 ]; then
+	archs="all $ARCH"
+    fi
+
+    for m1 in $MIRRORS; do
+	for s in $SUITE $EXTRA_SUITES; do
+	    for c in $COMPONENTS; do
+		for a in $archs; do
+		    path="dists/$s/$c/binary-$a/Packages"
+		    pkgdest="$TARGET/$($DLDEST pkg "$s" "$c" "$a" "$m1" "$path")"
+		    echo "$("$PKGDETAILS" GETDEPS "$pkgdest" $pkgs)"
+		done
+	    done
+	done
+    done
+    }
+
+work_out_debs () {
+	required="$(get_debs Priority: required)"
+	devuan_required="devuan-keyring sysvinit-core perl-base"
+
+	if doing_variant - || doing_variant fakechroot; then
+		#required="$required $(get_debs Priority: important)"
+		#  ^^ should be getting debconf here somehow maybe
+		base="$(get_debs Priority: important) $devuan_required"
+	elif doing_variant buildd; then
+		base="apt build-essential $devuan_required"
+	elif doing_variant minbase; then
+		base="apt $devuan_required"
+	fi
+
+	if doing_variant fakechroot; then
+		# ldd.fake needs binutils
+		required="$required binutils"
+	fi
+
+	case $MIRRORS in
+	    https://*)
+		base="$base apt-transport-https ca-certificates"
+		;;
+	esac
+
+	# Fixup dependencies: debootstrap doesn't resolve alternatives, so we
+	# need manual fixes.
+	if get_depends $base | grep '^systemd$' >/dev/null 2>&1 ; then
+	    case "$base" in
+		# Fix #796: recent versions of cron-daemon-common depend on
+		# systemd | systemd-standalone-sysusers | systemd-sysusers.
+		*cron-daemon-common*)
+		    required="$required systemd-standalone-sysusers"
+		    ;;
+	    esac
+	fi
+
+	# On suites >= daedalus if merged-/usr has been chosen or is the
+	# default, there is no need for the live migration 'usrmerge' package and
+	# its extra dependencies; instead install the empty 'usr-is-merged'
+	# metapackage to indicate that the transition has been done.
+	case "$CODENAME" in
+	    jessie*|ascii|beowulf|chimaera)
+	    ;;
+	    *)
+ 		if [ "$MERGED_USR" = "yes" -o "$CODENAME" != "daedalus" ]; then
+		    required="$required usr-is-merged"
+		    EXCLUDE_DEPENDENCY="$EXCLUDE_DEPENDENCY usrmerge"
+		fi
+		;;
+	esac
+	}
+
+first_stage_install () {
+	case "$CODENAME" in
+		jessie*|ascii) ;;
+		*)
+		    EXTRACT_DEB_TAR_OPTIONS="$EXTRACT_DEB_TAR_OPTIONS -k"
+		    ;;
+	esac
+
+	case "$CODENAME" in
+	    excalibur|freia|ceres)
+		if [ "$MERGED_USR" = "no" ]; then
+		    error 1 SANITYCHECK "Unmerged /usr is not compatible with $CODENAME"
+		fi
+		MERGED_USR="yes"
+		;;
+	esac
+
+	extract $required
+
+	if [ "$MERGED_USR" = "yes" ]; then
+	    merge_usr
+	fi
+
+	mkdir -p "$TARGET/var/lib/dpkg"
+	: >"$TARGET/var/lib/dpkg/status"
+	: >"$TARGET/var/lib/dpkg/available"
+
+	setup_etc
+	if [ ! -e "$TARGET/etc/fstab" ]; then
+		echo '# UNCONFIGURED FSTAB FOR BASE SYSTEM' > "$TARGET/etc/fstab"
+		chown 0:0 "$TARGET/etc/fstab"; chmod 644 "$TARGET/etc/fstab"
+	fi
+
+	setup_devices
+}
+
+second_stage_install () {
+	setup_dynamic_devices
+
+	x_feign_install () {
+		local pkg="$1"
+		local deb="$(debfor $pkg)"
+		local ver="$(in_target dpkg-deb -f "$deb" Version)"
+
+		mkdir -p "$TARGET/var/lib/dpkg/info"
+
+		echo \
+"Package: $pkg
+Version: $ver
+Maintainer: unknown
+Status: install ok installed" >> "$TARGET/var/lib/dpkg/status"
+
+		touch "$TARGET/var/lib/dpkg/info/${pkg}.list"
+	}
+
+	x_feign_install dpkg
+
+	x_core_install () {
+		smallyes '' | in_target dpkg --force-depends --install $(debfor "$@")
+	}
+
+	p () {
+		baseprog="$(($baseprog + ${1:-1}))"
+	}
+
+	if doing_variant fakechroot; then
+		setup_proc_symlink
+	else
+		setup_proc
+		in_target /sbin/ldconfig
+	fi
+
+	DEBIAN_FRONTEND=noninteractive
+	DEBCONF_NONINTERACTIVE_SEEN=true
+	export DEBIAN_FRONTEND DEBCONF_NONINTERACTIVE_SEEN
+
+	baseprog=0
+	bases=7
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #1
+	info INSTCORE "Installing core packages..."
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #2
+	ln -sf mawk "$TARGET/usr/bin/awk"
+	x_core_install base-passwd
+	x_core_install base-files
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #3
+	x_core_install dpkg
+
+	if [ ! -e "$TARGET/etc/localtime" ]; then
+		ln -sf /usr/share/zoneinfo/UTC "$TARGET/etc/localtime"
+	fi
+
+	if doing_variant fakechroot; then
+		install_fakechroot_tools
+	fi
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #4
+	x_core_install $LIBC
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #5
+	x_core_install perl-base
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #6
+	rm "$TARGET/usr/bin/awk"
+	x_core_install mawk
+
+	p; progress $baseprog $bases INSTCORE "Installing core packages" #7
+	if doing_variant -; then
+		x_core_install debconf
+	fi
+
+	baseprog=0
+	bases=$(set -- $required; echo $#)
+
+	info UNPACKREQ "Unpacking required packages..."
+
+	exec 7>&1
+
+	smallyes '' |
+		(repeatn 5 in_target_failmsg UNPACK_REQ_FAIL_FIVE "Failure while unpacking required packages.  This will be attempted up to five times." "" \
+		dpkg --status-fd 8 --force-depends --unpack $(debfor $required) 8>&1 1>&7 || echo EXITCODE $?) |
+		dpkg_progress $baseprog $bases UNPACKREQ "Unpacking required packages" UNPACKING
+
+	info CONFREQ "Configuring required packages..."
+
+	echo \
+"#!/bin/sh
+exit 101" > "$TARGET/usr/sbin/policy-rc.d"
+	chmod 755 "$TARGET/usr/sbin/policy-rc.d"
+
+	mv "$TARGET/sbin/start-stop-daemon" "$TARGET/sbin/start-stop-daemon.REAL"
+	echo \
+"#!/bin/sh
+echo
+echo \"Warning: Fake start-stop-daemon called, doing nothing\"" > "$TARGET/sbin/start-stop-daemon"
+	chmod 755 "$TARGET/sbin/start-stop-daemon"
+
+	setup_dselect_method apt
+
+	smallyes '' |
+		(in_target_failmsg CONF_REQ_FAIL "Failure while configuring required packages." "" \
+		dpkg --status-fd 8 --configure --pending --force-configure-any --force-depends 8>&1 1>&7 || echo EXITCODE $?) |
+		dpkg_progress $baseprog $bases CONFREQ "Configuring required packages" CONFIGURING
+
+	baseprog=0
+	bases="$(set -- $base; echo $#)"
+
+	info UNPACKBASE "Unpacking the base system..."
+
+	setup_available $required $base
+	done_predeps=
+	while predep=$(get_next_predep); do
+		# We have to resolve dependencies of pre-dependencies manually because
+		# dpkg --predep-package doesn't handle this.
+		predep=$(without "$(without "$(resolve_deps $predep)" "$required")" "$done_predeps")
+		# XXX: progress is tricky due to how dpkg_progress works
+		# -- cjwatson 2009-07-29
+		p; smallyes '' |
+		in_target dpkg --force-overwrite --force-confold --skip-same-version --install $(debfor $predep)
+		base=$(without "$base" "$predep")
+		done_predeps="$done_predeps $predep"
+	done
+
+	if [ -n "$base" ]; then
+		smallyes '' |
+			(repeatn 5 in_target_failmsg INST_BASE_FAIL_FIVE "Failure while installing base packages.  This will be re-attempted up to five times." "" \
+			dpkg --status-fd 8 --force-overwrite --force-confold --skip-same-version --unpack $(debfor $base) 8>&1 1>&7 || echo EXITCODE $?) |
+			dpkg_progress $baseprog $bases UNPACKBASE "Unpacking base system" UNPACKING
+
+		info CONFBASE "Configuring the base system..."
+
+		smallyes '' |
+			(repeatn 5 in_target_failmsg CONF_BASE_FAIL_FIVE "Failure while configuring base packages.  This will be re-attempted up to five times." "" \
+			dpkg --status-fd 8 --force-confold --skip-same-version --configure -a 8>&1 1>&7 || echo EXITCODE $?) |
+			dpkg_progress $baseprog $bases CONFBASE "Configuring base system" CONFIGURING
+	fi
+
+	mv "$TARGET/sbin/start-stop-daemon.REAL" "$TARGET/sbin/start-stop-daemon"
+	rm -f "$TARGET/usr/sbin/policy-rc.d"
+
+	progress $bases $bases CONFBASE "Configuring base system"
+	info BASESUCCESS "Base system installed successfully."
+}
+EOF
+
+
+
+echo ""
+echo "Patch sikeresen alkalmazva."
+echo ""
