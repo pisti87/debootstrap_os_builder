@@ -172,9 +172,9 @@ if [[ "$SKIP_CONFIG" -eq 0 ]]; then
 echo "*** Rendszer konfiguráció ***"
 
 read -rp "Distro neve (pl. Devuan): " DISTRO_NAME
-read -rp "Distro kompatibilitás (daedalus/excalibur): " DISTRO_COMPAT_VERSION
-read -rp "Distro verzió (pl. 6): " DISTRO_VERSION
-read -rp "Architektúra (amd64): " ARCH
+read -rp "Distro kompatibilitás (excalibur): " DISTRO_COMPAT_VERSION
+read -rp "Distro verzió (6): " DISTRO_VERSION
+read -rp "Architektúra (amd64, armhf, riscv64, i386, ppc64el, arm64, armel, all): " ARCH
 
 echo
 echo "*** Kernel konfiguráció ***"
